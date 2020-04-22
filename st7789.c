@@ -20,21 +20,20 @@ typedef struct {
 } LCD_ST7798_MT;
 
 
-/**[发送显示指令和数据: @type: 0 => 命令; 1 => 数据]*/
 int lcd_st7789_write_command(uint8_t cmd){
     bcm2835_gpio_clr(LCD_ST7789_GPIO_SPI_PIN_DC);
-    bcm2835_spi_writenb(&cmd, 1);
+    bcm2835_spi_writenb((const char*)&cmd, 1);
     return 0;
 }
 
 int lcd_st7789_write_data(uint8_t *data, uint32_t size){
     bcm2835_gpio_set(LCD_ST7789_GPIO_SPI_PIN_DC);
-    bcm2835_spi_writenb(data, size);
+    bcm2835_spi_writenb((const char*)data, size);
     return 0;
 }
 
 int lcd_st7789_write_unwrap(uint8_t *data, uint32_t size){
-    bcm2835_spi_writenb(data, size);
+    bcm2835_spi_writenb((const char*)data, size);
     return 0;
 }
 
@@ -83,12 +82,13 @@ int lcd_st7789_reset(){
         bcm2835_gpio_clr(LCD_ST7789_GPIO_SPI_PIN_RES);
         usleep(100000);
         bcm2835_gpio_set(LCD_ST7789_GPIO_SPI_PIN_RES);
+        usleep(100000);
     }
 
 
     {//设置显示扫描方向 默认值
         ret |= lcd_st7789_write_command(0x36);
-        param[0] = 0x70;
+        param[0] = 0x00;
         ret |= lcd_st7789_write_data(param, 1);
     }
     {//设置像素格式rgb 16bit/pixel 65K

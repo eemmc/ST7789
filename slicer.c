@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <pthread.h>
 
 #include <sys/time.h>
 
@@ -23,14 +24,25 @@ typedef struct {
     AVPacket packet;
     AVFrame *sframe;
     AVFrame *fframe;
+    AVFrame *cframe;
     int64_t last_pts;
     int64_t cur_usec;
     int stream_index;
     int decode_flush;
     int filter_flush;
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    pthread_t thread;
+    int finished;
 
     struct timeval times[4];
 } SlicerMemory;
+
+struct slicer_thread_parameter{
+    SlicerMemory *mem;
+    SlicerCallback callback;
+    void *refs;
+};
 
 int slicer_filter_init(Slicer *slicer){
     SlicerMemory *mem = (SlicerMemory*)slicer->priv;
@@ -101,35 +113,71 @@ END:
     return 0;
 }
 
-int slicer_display_frame(SlicerMemory *mem, SlicerCallback callback, void *refs){
+
+void* slicer_display_loop(void *param){
+    struct slicer_thread_parameter *p;
+
+    p = (struct slicer_thread_parameter*)param;
+    SlicerMemory *mem = p->mem;
+    SlicerCallback callback = p->callback;
+    void *refs = p->refs;
+
+    while(!mem->finished){
+        pthread_mutex_lock(&mem->mutex);
+
+        if(callback != NULL && av_frame_is_writable(mem->cframe)){
+            callback(refs, mem->cframe->data[0], mem->cframe->linesize[0]);
+        }
+
+        pthread_cond_wait(&mem->cond, &mem->mutex);
+        pthread_mutex_unlock(&mem->mutex);
+    }
+
+    return NULL;
+}
+
+
+int slicer_display_frame(SlicerMemory *mem){
 
     gettimeofday(&mem->times[0], NULL);
 
-//    struct timeval stamp;
-//    int64_t delay, offset;
-//    if(mem->fframe->pts != AV_NOPTS_VALUE){
-//        if(mem->last_pts != AV_NOPTS_VALUE){
-//            delay = av_rescale_q(mem->fframe->pts - mem->last_pts,
-//                                 mem->time, AV_TIME_BASE_Q);
-//            if(delay > 0 && delay < 5000000){
-//                gettimeofday(&stamp, NULL);
-//                offset = stamp.tv_sec * 1000000 + stamp.tv_usec;
-//                mem->cur_usec += delay;
-//                if(mem->cur_usec > offset){
-//                    usleep(mem->cur_usec - offset);
-//                }
-//            }
-//        }else{
-//            gettimeofday(&stamp, NULL);
-//            mem->cur_usec = stamp.tv_sec * 1000000 + stamp.tv_usec;
-//        }
+    uint8_t discarded = 0;
+    struct timeval stamp;
+    int64_t delay, offset;
+    if(mem->fframe->pts != AV_NOPTS_VALUE){
+        if(mem->last_pts != AV_NOPTS_VALUE){
+            delay = av_rescale_q(mem->fframe->pts - mem->last_pts,
+                                 mem->time, AV_TIME_BASE_Q);
+            if(delay > 0 && delay < 5000000){
+                gettimeofday(&stamp, NULL);
+                offset = stamp.tv_sec * 1000000 + stamp.tv_usec;
+                mem->cur_usec += delay;
+                if(mem->cur_usec > offset){
+                    usleep(mem->cur_usec - offset);
+                }else if( mem->cur_usec + 5000 < offset){
+                    // 时间不够，丢弃当前帧
+                    discarded = 1;
+                }
+            }
+        }else{
+            gettimeofday(&stamp, NULL);
+            mem->cur_usec = stamp.tv_sec * 1000000 + stamp.tv_usec;
+        }
 
-//        mem->last_pts = mem->fframe->pts;
-//    }
-
-    if(callback != NULL){
-        callback(refs, mem->fframe->data[0], mem->fframe->linesize[0]);
+        mem->last_pts = mem->fframe->pts;
     }
+
+
+    if (discarded == 0){
+        pthread_mutex_lock(&mem->mutex);
+
+        av_frame_unref(mem->cframe);
+        av_frame_move_ref(mem->cframe, mem->fframe);
+
+        pthread_cond_signal(&mem->cond);
+        pthread_mutex_unlock(&mem->mutex);
+    }
+
 
     gettimeofday(&mem->times[1], NULL);
 
@@ -140,12 +188,11 @@ int slicer_display_frame(SlicerMemory *mem, SlicerCallback callback, void *refs)
     timersub(&mem->times[1], &mem->times[3], &mem->times[2]);
     fprintf(stderr, "all use time.: %lu.%lu\n", mem->times[2].tv_sec, mem->times[2].tv_usec);
 
-
     gettimeofday(&mem->times[3], NULL);
     return 0;
 }
 
-int slicer_filter_frame(SlicerMemory *mem, SlicerCallback callback, void *refs){
+int slicer_filter_frame(SlicerMemory *mem){
     int ret;
     AVFrame *frame = !mem->filter_flush ? mem->sframe : NULL;
     if((ret = av_buffersrc_add_frame_flags(mem->fil_src_ctx, frame,
@@ -162,7 +209,7 @@ int slicer_filter_frame(SlicerMemory *mem, SlicerCallback callback, void *refs){
         }
 
         mem->time = mem->fil_swp_ctx->inputs[0]->time_base;
-        if((ret = slicer_display_frame(mem, callback, refs)) < 0){
+        if((ret = slicer_display_frame(mem)) < 0){
             return ret;
         }
 
@@ -172,7 +219,7 @@ int slicer_filter_frame(SlicerMemory *mem, SlicerCallback callback, void *refs){
     return 0;
 }
 
-int slicer_decode_frame(SlicerMemory *mem, SlicerCallback callback, void *refs){
+int slicer_decode_frame(SlicerMemory *mem){
     int ret;
     AVPacket *packet = !mem->decode_flush ? &mem->packet : NULL;
     if((ret = avcodec_send_packet(mem->codec_ctx, packet)) < 0){
@@ -189,7 +236,7 @@ int slicer_decode_frame(SlicerMemory *mem, SlicerCallback callback, void *refs){
 
         mem->sframe->pts = mem->sframe->best_effort_timestamp;
 
-        if((ret = slicer_filter_frame(mem, callback, refs)) < 0){
+        if((ret = slicer_filter_frame(mem)) < 0){
             return ret;
         }
 
@@ -240,6 +287,8 @@ int slicer_init(void *self, const char *filename){
         return ret;
     }
 
+    av_dump_format(mem->ifmt_ctx, 0, filename, 0);
+
     slicer->width  = mem->codec_ctx->width;
     slicer->height = mem->codec_ctx->height;
 
@@ -251,10 +300,16 @@ int slicer_loop(void *self, SlicerCallback callback, void *refs){
     SlicerMemory *mem = (SlicerMemory*)slicer->priv;
 
     int ret;
+    struct slicer_thread_parameter param = {
+        .mem      = mem,
+        .callback = callback,
+        .refs     = refs
+    };
 
     mem->sframe = av_frame_alloc();
     mem->fframe = av_frame_alloc();
-    if(!mem->sframe || !mem->fframe){
+    mem->cframe = av_frame_alloc();
+    if(!mem->sframe || !mem->fframe || !mem->cframe){
         fprintf(stderr, "Could not allocate buffer frame\n");
         return 1;
     }
@@ -263,13 +318,17 @@ int slicer_loop(void *self, SlicerCallback callback, void *refs){
         return ret;
     }
 
+
+    pthread_create(&mem->thread, NULL, &slicer_display_loop, &param);
+    pthread_detach(mem->thread);
+
     while(1){
         if((ret = av_read_frame(mem->ifmt_ctx, &mem->packet)) < 0){
             break;
         }
 
         if(mem->packet.stream_index == mem->stream_index){
-            if((ret = slicer_decode_frame(mem, callback, refs)) < 0){
+            if((ret = slicer_decode_frame(mem)) < 0){
                 return ret;
             }
         }
@@ -278,12 +337,12 @@ int slicer_loop(void *self, SlicerCallback callback, void *refs){
     }
 
     mem->decode_flush = 1;
-    if((ret = slicer_decode_frame(mem, callback, refs)) < 0){
+    if((ret = slicer_decode_frame(mem)) < 0){
         return ret;
     }
 
     mem->filter_flush = 1;
-    if((ret = slicer_filter_frame(mem, callback, refs)) < 0){
+    if((ret = slicer_filter_frame(mem)) < 0){
         return ret;
     }
 
@@ -294,12 +353,22 @@ int slicer_free(void *self){
     Slicer *slicer = (Slicer*)self;
     SlicerMemory *mem = (SlicerMemory*)slicer->priv;
 
+    if(!mem->finished){
+        mem->finished = 1;
+        pthread_mutex_lock(&mem->mutex);
+        pthread_cond_signal(&mem->cond);
+        pthread_mutex_unlock(&mem->mutex);
+        pthread_mutex_destroy(&mem->mutex);
+        pthread_cond_destroy(&mem->cond);
+    }
+
     avfilter_graph_free(&mem->fil_graph);
     avcodec_free_context(&mem->codec_ctx);
     avformat_close_input(&mem->ifmt_ctx);
     av_packet_unref(&mem->packet);
     av_frame_free(&mem->fframe);
     av_frame_free(&mem->sframe);
+    av_frame_free(&mem->cframe);
 
     free(mem);
 
@@ -323,6 +392,10 @@ Slicer * slicer_new(void){
     slicer->loop = &slicer_loop;
     slicer->free = &slicer_free;
     slicer->priv = mem;
+
+    mem->finished = 0;
+    pthread_mutex_init(&mem->mutex, NULL);
+    pthread_cond_init(&mem->cond, NULL);
 
     return slicer;
 }

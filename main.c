@@ -9,8 +9,8 @@
 #include "slicer.h"
 
 
-#define LCD_WIDTH  320
-#define LCD_HEIGHT 240
+#define LCD_WIDTH  240
+#define LCD_HEIGHT 320
 
 typedef struct {
     LCD_ST7789_DRI *driver;
@@ -20,9 +20,8 @@ typedef struct {
 } Memory;
 
 
-int display_frame(void *pointer, uint8_t *buffer, int linesize){
-    fprintf(stderr, "display_frame ready.\n");
 
+int display_frame(void *pointer, uint8_t *buffer, int linesize){
     Memory *refs = (Memory*)pointer;
 
     int i;
@@ -30,10 +29,9 @@ int display_frame(void *pointer, uint8_t *buffer, int linesize){
 
     ret |= refs->driver->output(refs->driver, NULL, 0, 0);
 
-    uint8_t *p = buffer;
-    for(i = 0; i <240; i++){
-        ret |= refs->driver->output(refs->driver, p, 640, 1);
-        p += linesize;
+    uint32_t flinesize = refs->scale_height * 2;
+    for(i = 0; i < refs->scale_width - 2; i++){
+        ret |= refs->driver->output(refs->driver, buffer + linesize * i, flinesize, 1);
     }
 
     if(ret != 0){
@@ -56,33 +54,44 @@ int main(int argc, char **argv) {
     refs->driver = lcd_st7789_init();
     refs->slicer = slicer_new();
 
+    //读取视频基本信息
     if(refs->slicer->init(refs->slicer, argv[1]) != 0){
         fprintf(stderr, "Slicer init Failed!\n");
         goto END;
     }
 
-    double scale;
-    if(refs->slicer->width > refs->slicer->height){
-        scale = LCD_WIDTH / (double)refs->slicer->width;
-        refs->scale_width  = LCD_WIDTH;
-        refs->scale_height = (int)(refs->slicer->height * scale);
+    //计算缩放比例
+    double scales[3];
+    scales[0] = (double)LCD_WIDTH / LCD_HEIGHT;
+    scales[1] = (double)refs->slicer->height / refs->slicer->width;
+    if(scales[0] >= scales[1]){
+        scales[2] = LCD_HEIGHT / (double)refs->slicer->width;
+        refs->scale_width  = LCD_HEIGHT;
+        refs->scale_height = (int)(refs->slicer->height * scales[2]);
     }else{
-        scale = LCD_HEIGHT / (double)refs->slicer->height;
-        refs->scale_width  = (int)(refs->slicer->width * scale);
-        refs->scale_height = LCD_HEIGHT;
+        scales[2] = LCD_WIDTH / (double)refs->slicer->height;
+        refs->scale_width  = (int)(refs->slicer->width * scales[2]);
+        refs->scale_height = LCD_WIDTH;
     }
 
-
-
+    //缩放后顺时针旋转90度
     snprintf(refs->slicer->command, sizeof(refs->slicer->command),
-             "scale=%d:%d", 320, 240);
+             "scale=%d:%d,transpose=clock",
+             refs->scale_width, refs->scale_height);
 
-    if(refs->driver->config(refs->driver, 0, 0,320, 240) != 0){
+    //计算LCD边缘偏移
+    int16_t left   = (LCD_WIDTH - refs->scale_height) / 2;
+    int16_t top    = (LCD_HEIGHT - refs->scale_width) / 2;
+    int16_t right  = left + refs->scale_height - 1;
+    int16_t bottom = top + refs->scale_width - 1;
+    fprintf(stderr, "size: [%d, %d, %d, %d]\n", left, top, right, bottom);
+
+    if(refs->driver->config(refs->driver, left, top, right, bottom) != 0){
         fprintf(stderr, "LCD config Failed\n");
         goto END;
     }
 
-
+    //循环解码
     if(refs->slicer->loop(refs->slicer, &display_frame, refs) != 0){
         fprintf(stderr, "Slicer parse video Failed!\n");
         goto END;
